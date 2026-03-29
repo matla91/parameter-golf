@@ -21,7 +21,7 @@ source "$CONFIG"
 
 STAMP=$(date +%Y%m%d_%H%M%S)
 GIT_SHA=$(git rev-parse --short HEAD)
-RUN_ID="${RUN_NAME}_${STAMP}_${GIT_SHA}"
+RUN_ID="${RUN_ID}_${STAMP}_${GIT_SHA}"
 OUT_DIR="$EXP_DIR/runs/$RUN_ID"
 
 mkdir -p "$OUT_DIR"
