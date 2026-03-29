@@ -43,4 +43,4 @@ echo "OUT_DIR=$OUT_DIR"
 echo "SCRIPT=$SCRIPT"
 echo "CONFIG=$CONFIG"
 
-python "$SCRIPT" 2>&1 | tee "$OUT_DIR/console.log"
+python -u "$SCRIPT" > "$OUT_DIR/console.log" 2>&1
