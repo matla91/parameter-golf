@@ -34,10 +34,13 @@ printf '%s\n' "CONFIG=$CONFIG" "SCRIPT=$SCRIPT" "RUN_ID=$RUN_ID" > "$OUT_DIR/run
 
 export RUN_ID
 export OUT_DIR
+export NCCL_IB_DISABLE=1
+export NCCL_P2P_DISABLE=1
+export PYTHONUNBUFFERED=1
 
 echo "RUN_ID=$RUN_ID"
 echo "OUT_DIR=$OUT_DIR"
 echo "SCRIPT=$SCRIPT"
 echo "CONFIG=$CONFIG"
 
-torchrun --standalone --nproc_per_node=1 "$SCRIPT" 2>&1 | tee "$OUT_DIR/console.log"
+python "$SCRIPT" 2>&1 | tee "$OUT_DIR/console.log"
