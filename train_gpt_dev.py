@@ -6,26 +6,46 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 
 from __future__ import annotations
 
+import os
+import sys
+
+# --- DIAGNOSTIC INITIAL ---
+print("START: Script Python lancé", flush=True)
+print(f"DEBUG: Python executable: {sys.executable}", flush=True)
+print(f"DEBUG: Working directory: {os.getcwd()}", flush=True)
+
 import copy
 import glob
 import io
 import math
-import os
 import random
 import subprocess
-import sys
 import time
 import uuid
+
+print("DEBUG: Imports standards OK", flush=True)
+
 import lzma
 from pathlib import Path
 
+print("DEBUG: LZMA et Pathlib OK", flush=True)
+
 import numpy as np
+print("DEBUG: NumPy OK", flush=True)
+
 import sentencepiece as spm
+print("DEBUG: SentencePiece OK", flush=True)
+
+print("DEBUG: Tentative import Torch...", flush=True)
 import torch
+print(f"DEBUG: Torch OK (Version: {torch.__version__})", flush=True)
+
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+print("DEBUG: Tous les imports sont terminés", flush=True)
 
 # -----------------------------
 # HYPERPARAMETERS
