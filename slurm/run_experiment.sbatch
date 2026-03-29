@@ -7,7 +7,6 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 
-# 1. Nettoyage et chargement des modules (CRITIQUE)
 module --force purge
 module load StdEnv/2023
 module load python/3.11
@@ -15,22 +14,26 @@ module load gcc
 module load arrow/23.0.1
 module load cuda
 
-# 2. Setup Environnement
 cd /scratch/matla/ml_projects/parameter-golf
 source venv/bin/activate
 
-# 3. Chemins et Config
 export TRITON_CACHE_DIR=/scratch/matla/ml_projects/experiments/parameter_golf/triton_cache
 mkdir -p "$TRITON_CACHE_DIR"
 
-# On charge la config .env passée par --export
 if [ -f "$CONFIG" ]; then
+    set -a
     source "$CONFIG"
+    set +a
+else
+    echo "ERROR: CONFIG file not found: $CONFIG"
+    exit 1
 fi
 
-# Variables de sécurité
 export MAX_WALLCLOCK_SECONDS=0
 export PYTHONUNBUFFERED=1
 
-# 4. Lancement (On remet torchrun qui est plus propre pour l'init GPU)
+echo "SCRIPT=$SCRIPT"
+echo "CONFIG=$CONFIG"
+env | grep -E '^(RUN_ID|DATA_PATH|TOKENIZER_PATH|VOCAB_SIZE|COMPILE_MODEL|COMPILE_MUON|COMPRESSION|LZMA_PRESET|MAX_WALLCLOCK_SECONDS|PYTHONUNBUFFERED)='
+
 torchrun --standalone --nproc_per_node=1 "$SCRIPT"
