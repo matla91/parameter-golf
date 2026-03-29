@@ -1,46 +1,36 @@
-#!/usr/bin/env bash
-#SBATCH --job-name=pg
-#SBATCH --output=/scratch/matla/ml_projects/experiments/parameter_golf/slurm_logs/%x_%j.out
+#!/bin/bash
+#SBATCH --job-name=pg_dev
+#SBATCH --output=/scratch/matla/ml_projects/experiments/parameter_golf/slurm_%j.out
+#SBATCH --error=/scratch/matla/ml_projects/experiments/parameter_golf/slurm_%j.err
+#SBATCH --time=02:30:00
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=02:30:00
 
-set -euo pipefail
+# 1. Nettoyage et chargement des modules (CRITIQUE)
+module --force purge
+module load StdEnv/2023
+module load python/3.11
+module load gcc
+module load arrow/23.0.1
+module load cuda
 
-REPO_DIR="/scratch/matla/ml_projects/parameter-golf"
-EXP_DIR="/scratch/matla/ml_projects/experiments/parameter_golf"
+# 2. Setup Environnement
+cd /scratch/matla/ml_projects/parameter-golf
+source venv/bin/activate
 
-cd "$REPO_DIR"
+# 3. Chemins et Config
+export TRITON_CACHE_DIR=/scratch/matla/ml_projects/experiments/parameter_golf/triton_cache
+mkdir -p "$TRITON_CACHE_DIR"
 
-if [ -f .venv/bin/activate ]; then
-    source .venv/bin/activate
+# On charge la config .env passée par --export
+if [ -f "$CONFIG" ]; then
+    source "$CONFIG"
 fi
 
-source "$CONFIG"
-
-STAMP=$(date +%Y%m%d_%H%M%S)
-GIT_SHA=$(git rev-parse --short HEAD)
-RUN_ID="${RUN_ID}_${STAMP}_${GIT_SHA}"
-OUT_DIR="$EXP_DIR/runs/$RUN_ID"
-
-mkdir -p "$OUT_DIR"
-mkdir -p "$EXP_DIR/slurm_logs"
-
-cp "$CONFIG" "$OUT_DIR/config.env"
-cp "$SCRIPT" "$OUT_DIR/$(basename "$SCRIPT")"
-git rev-parse HEAD > "$OUT_DIR/git_commit.txt"
-printf '%s\n' "CONFIG=$CONFIG" "SCRIPT=$SCRIPT" "RUN_ID=$RUN_ID" > "$OUT_DIR/run_info.txt"
-
-export RUN_ID
-export OUT_DIR
-export NCCL_IB_DISABLE=1
-export NCCL_P2P_DISABLE=1
+# Variables de sécurité
+export MAX_WALLCLOCK_SECONDS=0
 export PYTHONUNBUFFERED=1
 
-echo "RUN_ID=$RUN_ID"
-echo "OUT_DIR=$OUT_DIR"
-echo "SCRIPT=$SCRIPT"
-echo "CONFIG=$CONFIG"
-
-python -u "$SCRIPT" > "$OUT_DIR/console.log" 2>&1
+# 4. Lancement (On remet torchrun qui est plus propre pour l'init GPU)
+torchrun --standalone --nproc_per_node=1 "$SCRIPT"
