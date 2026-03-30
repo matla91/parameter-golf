@@ -333,7 +333,7 @@ def eval_val(
 # POST-TRAINING QUANTIZATION
 # -----------------------------
 #
-# B2: rotation ligne seulement + int8 + lzma
+# Expérience : block transforms locaux + int8 per-row + lzma
 #
 # On ne touche qu'aux tenseurs 2D éligibles :
 # - embeddings
@@ -347,10 +347,13 @@ def eval_val(
 # - scales
 # - tenseurs de contrôle (attn_scale, mlp_scale, resid_mix, q_gain, skip_weights, etc.)
 #
-# Pour chaque matrice 2D W éligible :
-#   1) appliquer une rotation orthogonale fixe sur les lignes
-#   2) quantifier en int8 per-row comme d'habitude
-#   3) au chargement, déquantifier puis appliquer la rotation inverse
+# Idée : avant quantification int8 per-row, appliquer une transformation locale,
+# déterministe, réversible et peu coûteuse à stocker :
+# - perm_sign_col_blocks : permutation + flips de signe par blocs de colonnes
+# - perm_sign_row_blocks : permutation + flips de signe par blocs de lignes
+#
+# La transformation est régénérée à partir d'un seed global, du nom du tenseur
+# et de sa shape. Aucune grosse matrice dense n'est stockée.
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
@@ -374,14 +377,25 @@ INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 
-# Rotation ligne seulement sur matrices 2D éligibles
-INT8_ROTATE_ROW_2D = bool(int(os.environ.get("INT8_ROTATE_ROW_2D", "1")))
-INT8_ROTATE_SEED = int(os.environ.get("INT8_ROTATE_SEED", "1337"))
-INT8_ROTATE_NON_POWER2_FALLBACK = os.environ.get(
-    "INT8_ROTATE_NON_POWER2_FALLBACK", "qr"
+INT8_BLOCK_TRANSFORM_MODE = os.environ.get(
+    "INT8_BLOCK_TRANSFORM_MODE", "none"
 ).lower()
+INT8_BLOCK_SIZE = int(os.environ.get("INT8_BLOCK_SIZE", "32"))
+INT8_BLOCK_TRANSFORM_SEED = int(os.environ.get("INT8_BLOCK_TRANSFORM_SEED", "1337"))
+VALID_INT8_BLOCK_TRANSFORM_MODES = {
+    "none",
+    "perm_sign_col_blocks",
+    "perm_sign_row_blocks",
+}
+if INT8_BLOCK_TRANSFORM_MODE not in VALID_INT8_BLOCK_TRANSFORM_MODES:
+    raise ValueError(
+        "INT8_BLOCK_TRANSFORM_MODE must be one of "
+        f"{sorted(VALID_INT8_BLOCK_TRANSFORM_MODES)}, got {INT8_BLOCK_TRANSFORM_MODE!r}"
+    )
+if INT8_BLOCK_SIZE <= 0:
+    raise ValueError(f"INT8_BLOCK_SIZE must be positive, got {INT8_BLOCK_SIZE}")
 
-_ROTATION_CACHE: dict[tuple[str, int, int], object] = {}
+_BLOCK_TRANSFORM_CACHE: dict[tuple[object, ...], tuple[Tensor, Tensor, Tensor]] = {}
 
 
 def tensor_nbytes(t: Tensor) -> int:
@@ -399,147 +413,167 @@ def keep_float_tensor(
     return t
 
 
-def is_power_of_two(n: int) -> bool:
-    return n > 0 and (n & (n - 1)) == 0
-
-
-def should_rotate_2d_tensor(name: str, t: Tensor) -> bool:
+def should_block_transform_2d_tensor(name: str, t: Tensor) -> bool:
     return (
-        INT8_ROTATE_ROW_2D
+        INT8_BLOCK_TRANSFORM_MODE != "none"
         and t.ndim == 2
         and t.is_floating_point()
         and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     )
 
 
-def _rotation_seed_for_nrows(nrows: int) -> int:
-    # Seed fixe, déterministe, dépendant seulement de la config globale et de la hauteur.
-    return (INT8_ROTATE_SEED * 1_000_003 + nrows * 9_176 + 17) & 0x7FFFFFFF
+def get_block_transform_axis(mode: str) -> int | None:
+    if mode == "perm_sign_col_blocks":
+        return 1
+    if mode == "perm_sign_row_blocks":
+        return 0
+    if mode == "none":
+        return None
+    raise ValueError(f"Unknown INT8 block transform mode: {mode}")
 
 
-def _get_hadamard_signs_perm(
-    nrows: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    key = ("hadamard_meta_rows", nrows, _rotation_seed_for_nrows(nrows))
-    cached = _ROTATION_CACHE.get(key)
-    if cached is not None:
-        return cached  # type: ignore[return-value]
+def _stable_hash_u64(text: str) -> int:
+    # FNV-1a 64-bit stable hash.
+    h = 1469598103934665603
+    for b in text.encode("utf-8"):
+        h ^= b
+        h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return h
 
-    g = torch.Generator(device="cpu")
-    g.manual_seed(_rotation_seed_for_nrows(nrows))
 
-    signs = torch.randint(
-        low=0, high=2, size=(nrows,), generator=g, dtype=torch.int64
+def _mix_u64(*values: int) -> int:
+    h = 0x9E3779B97F4A7C15
+    for value in values:
+        x = int(value) & 0xFFFFFFFFFFFFFFFF
+        h ^= (x + 0x9E3779B97F4A7C15 + ((h << 6) & 0xFFFFFFFFFFFFFFFF) + (h >> 2))
+        h &= 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def _tensor_transform_base_seed(name: str, shape: tuple[int, int], mode: str, axis: int) -> int:
+    return _mix_u64(
+        INT8_BLOCK_TRANSFORM_SEED,
+        _stable_hash_u64(name),
+        _stable_hash_u64(mode),
+        axis,
+        shape[0],
+        shape[1],
+        INT8_BLOCK_SIZE,
     )
-    signs = (signs * 2 - 1).to(torch.float32).contiguous()
-    perm = torch.randperm(nrows, generator=g, dtype=torch.int64)
-    invperm = torch.empty_like(perm)
-    invperm[perm] = torch.arange(nrows, dtype=torch.int64)
 
-    out = (signs, perm, invperm)
-    _ROTATION_CACHE[key] = out
+
+def _get_block_perm_sign(
+    *,
+    name: str,
+    shape: tuple[int, int],
+    mode: str,
+    axis: int,
+    block_start: int,
+    block_len: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    block_seed = _mix_u64(
+        _tensor_transform_base_seed(name, shape, mode, axis),
+        block_start,
+        block_len,
+    )
+    key = ("perm_sign_block", mode, axis, shape[0], shape[1], block_start, block_len, block_seed)
+    cached = _BLOCK_TRANSFORM_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(block_seed & 0x7FFFFFFFFFFFFFFF))
+    perm = torch.randperm(block_len, generator=gen, dtype=torch.int64)
+    invperm = torch.empty_like(perm)
+    invperm[perm] = torch.arange(block_len, dtype=torch.int64)
+    signs = torch.randint(low=0, high=2, size=(block_len,), generator=gen, dtype=torch.int64)
+    signs = (signs * 2 - 1).to(torch.float32).contiguous()
+
+    out = (perm, invperm, signs)
+    _BLOCK_TRANSFORM_CACHE[key] = out
     return out
 
 
-def _fwht_last_dim(x: Tensor) -> Tensor:
-    # Fast Walsh-Hadamard Transform sur la dernière dimension.
-    # Hypothèse : taille puissance de 2.
-    n = x.shape[-1]
-    h = 1
-    y = x.contiguous()
-    while h < n:
-        y = y.view(*y.shape[:-1], -1, 2, h)
-        a = y[..., 0, :].clone()
-        b = y[..., 1, :].clone()
-        y[..., 0, :] = a + b
-        y[..., 1, :] = a - b
-        y = y.view(*y.shape[:-3], -1)
-        h *= 2
-    return y
-
-
-def _fwht_rows(x: Tensor) -> Tensor:
-    # Applique la FWHT sur l'axe 0 via transpose.
-    return _fwht_last_dim(x.transpose(0, 1)).transpose(0, 1).contiguous()
-
-
-def _apply_hadamard_row_rotation(
-    t: Tensor, *, inverse: bool = False
+def apply_block_transform(
+    name: str,
+    t: Tensor,
+    *,
+    inverse: bool = False,
+    mode: str | None = None,
+    block_size: int | None = None,
 ) -> Tensor:
-    # Rotation orthogonale R = H D P, appliquée à gauche : W_rot = R @ W
-    # Inverse : W = R^T @ W_rot = P^T D H @ W_rot
-    nrows = t.shape[0]
-    if not is_power_of_two(nrows):
-        raise ValueError(f"Hadamard rotation requires power-of-two rows, got {nrows}")
-
-    signs, perm, invperm = _get_hadamard_signs_perm(nrows)
     work = t.float().contiguous()
+    current_mode = INT8_BLOCK_TRANSFORM_MODE if mode is None else mode
+    current_block_size = INT8_BLOCK_SIZE if block_size is None else block_size
 
-    if not inverse:
-        work = work[perm, :]
-        work = work * signs[:, None]
-        work = _fwht_rows(work)
-        work.mul_(1.0 / math.sqrt(nrows))
-        return work.contiguous()
+    if current_mode == "none":
+        return work
+    if work.ndim != 2:
+        raise ValueError(f"Block transform expects a 2D tensor, got ndim={work.ndim}")
+    if current_block_size <= 0:
+        raise ValueError(f"Block size must be positive, got {current_block_size}")
 
-    work = _fwht_rows(work)
-    work.mul_(1.0 / math.sqrt(nrows))
-    work = work * signs[:, None]
-    work = work[invperm, :]
-    return work.contiguous()
+    axis = get_block_transform_axis(current_mode)
+    if axis is None:
+        return work
+
+    shape = (int(work.shape[0]), int(work.shape[1]))
+    out = torch.empty_like(work)
+
+    if axis == 1:
+        for block_start in range(0, shape[1], current_block_size):
+            block_end = min(block_start + current_block_size, shape[1])
+            block_len = block_end - block_start
+            perm, invperm, signs = _get_block_perm_sign(
+                name=name,
+                shape=shape,
+                mode=current_mode,
+                axis=axis,
+                block_start=block_start,
+                block_len=block_len,
+            )
+            block = work[:, block_start:block_end]
+            if inverse:
+                out[:, block_start:block_end] = block[:, invperm] * signs[None, :]
+            else:
+                out[:, block_start:block_end] = (block * signs[None, :])[:, perm]
+        return out.contiguous()
+
+    if axis == 0:
+        for block_start in range(0, shape[0], current_block_size):
+            block_end = min(block_start + current_block_size, shape[0])
+            block_len = block_end - block_start
+            perm, invperm, signs = _get_block_perm_sign(
+                name=name,
+                shape=shape,
+                mode=current_mode,
+                axis=axis,
+                block_start=block_start,
+                block_len=block_len,
+            )
+            block = work[block_start:block_end, :]
+            if inverse:
+                out[block_start:block_end, :] = block[invperm, :] * signs[:, None]
+            else:
+                out[block_start:block_end, :] = (block * signs[:, None])[perm, :]
+        return out.contiguous()
+
+    raise ValueError(f"Unsupported transform axis: {axis}")
 
 
-def _get_qr_rotation(nrows: int) -> Tensor:
-    key = ("qr_matrix_rows", nrows, _rotation_seed_for_nrows(nrows))
-    cached = _ROTATION_CACHE.get(key)
-    if cached is not None:
-        return cached  # type: ignore[return-value]
-
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(_rotation_seed_for_nrows(nrows))
-    a = torch.randn((nrows, nrows), generator=gen, dtype=torch.float64)
-    q, r = torch.linalg.qr(a, mode="reduced")
-    diag_sign = torch.sign(torch.diag(r))
-    diag_sign[diag_sign == 0] = 1.0
-    q = (q * diag_sign.unsqueeze(0)).to(torch.float32).contiguous()
-
-    _ROTATION_CACHE[key] = q
-    return q
-
-
-def _apply_qr_row_rotation(
-    t: Tensor, *, inverse: bool = False
-) -> Tensor:
-    nrows = t.shape[0]
-    q = _get_qr_rotation(nrows)
-    work = t.float().contiguous()
-    if inverse:
-        return (q.T @ work).contiguous()
-    return (q @ work).contiguous()
-
-
-def get_row_rotation_kind_for_tensor(name: str, t: Tensor) -> str | None:
-    if not should_rotate_2d_tensor(name, t):
+def get_block_transform_meta_for_tensor(
+    name: str, t: Tensor
+) -> dict[str, object] | None:
+    if not should_block_transform_2d_tensor(name, t):
         return None
-    nrows = int(t.shape[0])
-    if is_power_of_two(nrows):
-        return "hadamard"
-    if INT8_ROTATE_NON_POWER2_FALLBACK == "qr":
-        return "qr"
-    return None
-
-
-def apply_fixed_row_rotation(
-    name: str, t: Tensor, *, inverse: bool = False, rotation_kind: str | None = None
-) -> Tensor:
-    kind = rotation_kind if rotation_kind is not None else get_row_rotation_kind_for_tensor(name, t)
-    if kind is None:
-        return t.float().contiguous()
-    if kind == "hadamard":
-        return _apply_hadamard_row_rotation(t, inverse=inverse)
-    if kind == "qr":
-        return _apply_qr_row_rotation(t, inverse=inverse)
-    raise ValueError(f"Unknown row rotation kind: {kind}")
+    axis = get_block_transform_axis(INT8_BLOCK_TRANSFORM_MODE)
+    if axis is None:
+        return None
+    return {
+        "block_transform_mode": INT8_BLOCK_TRANSFORM_MODE,
+        "transformed_axis": axis,
+        "block_size": INT8_BLOCK_SIZE,
+    }
 
 
 def quantize_float_tensor(
@@ -549,20 +583,16 @@ def quantize_float_tensor(
     qmeta_extra: dict[str, object] | None = None
 
     if t32.ndim == 2:
-        rotation_kind = None
         if name is not None:
-            rotation_kind = get_row_rotation_kind_for_tensor(name, t32)
-        if rotation_kind is not None:
-            t32 = apply_fixed_row_rotation(
+            qmeta_extra = get_block_transform_meta_for_tensor(name, t32)
+        if qmeta_extra is not None:
+            t32 = apply_block_transform(
                 name if name is not None else "",
                 t32,
                 inverse=False,
-                rotation_kind=rotation_kind,
+                mode=str(qmeta_extra["block_transform_mode"]),
+                block_size=int(qmeta_extra["block_size"]),
             )
-            qmeta_extra = {
-                "row_rotation": rotation_kind,
-                "rotated_axis": 0,
-            }
 
         # Matrices: per-row int8, comme avant.
         clip_abs = (
@@ -581,7 +611,7 @@ def quantize_float_tensor(
         )
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), qmeta_extra
 
-    # Vectors / scalars : inchangé, sans rotation.
+    # Vectors / scalars : inchangé, sans transformation par blocs.
     clip_abs = (
         float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item())
         if t32.numel()
@@ -604,7 +634,7 @@ def quantize_float_tensor(
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Export format :
-    # - 2D float tensors éligibles : rotation ligne fixe + int8 per-row
+    # - 2D float tensors éligibles : block transform local + int8 per-row
     # - autres float tensors : int8 comme avant
     # - non-floats : passthrough exact
     # - petits float tensors : passthrough fp16/fp32
@@ -622,7 +652,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             "num_nonfloat_tensors",
             "baseline_tensor_bytes",
             "int8_payload_bytes",
-            "num_rotated_2d_tensors",
+            "num_block_transformed_2d_tensors",
         ),
         0,
     )
@@ -656,7 +686,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             if meta is None:
                 meta = {}
             meta.update(qmeta_extra)
-            stats["num_rotated_2d_tensors"] += 1
+            stats["num_block_transformed_2d_tensors"] += 1
         if meta is not None:
             qmeta[name] = meta
 
@@ -666,7 +696,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
 
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_rowrot_v2",
+        "__quant_format__": "int8_clean_per_row_blockperm_v1",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -698,13 +728,15 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             scale = float(s.item())
             deq = (q.float() * scale).contiguous()
 
-        rotation_kind = meta.get("row_rotation")
-        if isinstance(rotation_kind, str) and deq.ndim == 2:
-            deq = apply_fixed_row_rotation(
+        block_transform_mode = meta.get("block_transform_mode")
+        if isinstance(block_transform_mode, str) and deq.ndim == 2:
+            block_size = int(meta.get("block_size", INT8_BLOCK_SIZE))
+            deq = apply_block_transform(
                 name,
                 deq,
                 inverse=True,
-                rotation_kind=rotation_kind,
+                mode=block_transform_mode,
+                block_size=block_size,
             )
 
         out[name] = deq.to(dtype=dtype).contiguous()
@@ -1512,9 +1544,13 @@ def main() -> None:
         log0(
             f"Serialized model int8+lzma: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} "
-            f"payload_ratio:{ratio:.2f}x rotated_2d:{quant_stats['num_rotated_2d_tensors']})"
+            f"payload_ratio:{ratio:.2f}x block_transform_mode:{INT8_BLOCK_TRANSFORM_MODE} block_size:{INT8_BLOCK_SIZE} block_transformed_2d:{quant_stats['num_block_transformed_2d_tensors']})"
         )
         log0(f"Total submission size int8+lzma: {quant_file_bytes + code_bytes} bytes")
+        log0(
+            f"int8_block_transform_summary mode:{INT8_BLOCK_TRANSFORM_MODE} "
+            f"block_size:{INT8_BLOCK_SIZE} transformed_2d:{quant_stats['num_block_transformed_2d_tensors']}"
+        )
 
     if distributed:
         dist.barrier()
@@ -1553,3 +1589,23 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# -----------------------------------------------------------------------------
+# Block transform modes
+#
+# perm_sign_col_blocks:
+# - découpe chaque matrice 2D en blocs de colonnes de taille INT8_BLOCK_SIZE
+# - dans chaque bloc, applique des flips de signe puis une permutation fixe,
+#   déterministe et régénérable depuis le seed global + le nom du tenseur + sa shape
+# - la quantification int8 per-row est ensuite appliquée sur la matrice transformée
+#
+# perm_sign_row_blocks:
+# - même idée, mais en opérant sur des blocs de lignes au lieu des colonnes
+# - cela agit comme une transformation locale bloc-par-bloc sur l'axe 0
+#
+# Pourquoi c'est plus léger que les rotations globales :
+# - aucune QR dense
+# - aucune Hadamard globale
+# - aucune matrice orthogonale complète à stocker ou multiplier
+# - seulement des permutations locales + signes ±1, régénérés à partir d'un seed
+# - coût mémoire et métadonnées très faibles, mieux alignés avec int8 per-row + lzma
