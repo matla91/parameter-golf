@@ -333,7 +333,7 @@ def eval_val(
 # POST-TRAINING QUANTIZATION
 # -----------------------------
 #
-# B1: rotation colonne seulement + int8 + lzma
+# B2: rotation ligne seulement + int8 + lzma
 #
 # On ne touche qu'aux tenseurs 2D éligibles :
 # - embeddings
@@ -348,7 +348,7 @@ def eval_val(
 # - tenseurs de contrôle (attn_scale, mlp_scale, resid_mix, q_gain, skip_weights, etc.)
 #
 # Pour chaque matrice 2D W éligible :
-#   1) appliquer une rotation orthogonale fixe sur les colonnes
+#   1) appliquer une rotation orthogonale fixe sur les lignes
 #   2) quantifier en int8 per-row comme d'habitude
 #   3) au chargement, déquantifier puis appliquer la rotation inverse
 
@@ -374,8 +374,8 @@ INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 
-# Rotation colonne seulement sur matrices 2D éligibles
-INT8_ROTATE_COLUMN_2D = bool(int(os.environ.get("INT8_ROTATE_COLUMN_2D", "1")))
+# Rotation ligne seulement sur matrices 2D éligibles
+INT8_ROTATE_ROW_2D = bool(int(os.environ.get("INT8_ROTATE_ROW_2D", "1")))
 INT8_ROTATE_SEED = int(os.environ.get("INT8_ROTATE_SEED", "1337"))
 INT8_ROTATE_NON_POWER2_FALLBACK = os.environ.get(
     "INT8_ROTATE_NON_POWER2_FALLBACK", "qr"
@@ -405,36 +405,36 @@ def is_power_of_two(n: int) -> bool:
 
 def should_rotate_2d_tensor(name: str, t: Tensor) -> bool:
     return (
-        INT8_ROTATE_COLUMN_2D
+        INT8_ROTATE_ROW_2D
         and t.ndim == 2
         and t.is_floating_point()
         and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     )
 
 
-def _rotation_seed_for_ncols(ncols: int) -> int:
-    # Seed fixe, déterministe, dépendant seulement de la config globale et de la largeur.
-    return (INT8_ROTATE_SEED * 1_000_003 + ncols * 9_176 + 17) & 0x7FFFFFFF
+def _rotation_seed_for_nrows(nrows: int) -> int:
+    # Seed fixe, déterministe, dépendant seulement de la config globale et de la hauteur.
+    return (INT8_ROTATE_SEED * 1_000_003 + nrows * 9_176 + 17) & 0x7FFFFFFF
 
 
 def _get_hadamard_signs_perm(
-    ncols: int,
+    nrows: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    key = ("hadamard_meta", ncols, _rotation_seed_for_ncols(ncols))
+    key = ("hadamard_meta_rows", nrows, _rotation_seed_for_nrows(nrows))
     cached = _ROTATION_CACHE.get(key)
     if cached is not None:
         return cached  # type: ignore[return-value]
 
     g = torch.Generator(device="cpu")
-    g.manual_seed(_rotation_seed_for_ncols(ncols))
+    g.manual_seed(_rotation_seed_for_nrows(nrows))
 
     signs = torch.randint(
-        low=0, high=2, size=(ncols,), generator=g, dtype=torch.int64
+        low=0, high=2, size=(nrows,), generator=g, dtype=torch.int64
     )
     signs = (signs * 2 - 1).to(torch.float32).contiguous()
-    perm = torch.randperm(ncols, generator=g, dtype=torch.int64)
+    perm = torch.randperm(nrows, generator=g, dtype=torch.int64)
     invperm = torch.empty_like(perm)
-    invperm[perm] = torch.arange(ncols, dtype=torch.int64)
+    invperm[perm] = torch.arange(nrows, dtype=torch.int64)
 
     out = (signs, perm, invperm)
     _ROTATION_CACHE[key] = out
@@ -458,41 +458,46 @@ def _fwht_last_dim(x: Tensor) -> Tensor:
     return y
 
 
-def _apply_hadamard_column_rotation(
+def _fwht_rows(x: Tensor) -> Tensor:
+    # Applique la FWHT sur l'axe 0 via transpose.
+    return _fwht_last_dim(x.transpose(0, 1)).transpose(0, 1).contiguous()
+
+
+def _apply_hadamard_row_rotation(
     t: Tensor, *, inverse: bool = False
 ) -> Tensor:
-    # Rotation orthogonale R = P D H, appliquée à droite : W_rot = W @ R
-    # Inverse : W = W_rot @ R^T = W_rot @ H D P^T
-    ncols = t.shape[1]
-    if not is_power_of_two(ncols):
-        raise ValueError(f"Hadamard rotation requires power-of-two columns, got {ncols}")
+    # Rotation orthogonale R = H D P, appliquée à gauche : W_rot = R @ W
+    # Inverse : W = R^T @ W_rot = P^T D H @ W_rot
+    nrows = t.shape[0]
+    if not is_power_of_two(nrows):
+        raise ValueError(f"Hadamard rotation requires power-of-two rows, got {nrows}")
 
-    signs, perm, invperm = _get_hadamard_signs_perm(ncols)
+    signs, perm, invperm = _get_hadamard_signs_perm(nrows)
     work = t.float().contiguous()
 
     if not inverse:
-        work = work[:, perm]
-        work = work * signs[None, :]
-        work = _fwht_last_dim(work)
-        work.mul_(1.0 / math.sqrt(ncols))
+        work = work[perm, :]
+        work = work * signs[:, None]
+        work = _fwht_rows(work)
+        work.mul_(1.0 / math.sqrt(nrows))
         return work.contiguous()
 
-    work = _fwht_last_dim(work)
-    work.mul_(1.0 / math.sqrt(ncols))
-    work = work * signs[None, :]
-    work = work[:, invperm]
+    work = _fwht_rows(work)
+    work.mul_(1.0 / math.sqrt(nrows))
+    work = work * signs[:, None]
+    work = work[invperm, :]
     return work.contiguous()
 
 
-def _get_qr_rotation(ncols: int) -> Tensor:
-    key = ("qr_matrix", ncols, _rotation_seed_for_ncols(ncols))
+def _get_qr_rotation(nrows: int) -> Tensor:
+    key = ("qr_matrix_rows", nrows, _rotation_seed_for_nrows(nrows))
     cached = _ROTATION_CACHE.get(key)
     if cached is not None:
         return cached  # type: ignore[return-value]
 
     gen = torch.Generator(device="cpu")
-    gen.manual_seed(_rotation_seed_for_ncols(ncols))
-    a = torch.randn((ncols, ncols), generator=gen, dtype=torch.float64)
+    gen.manual_seed(_rotation_seed_for_nrows(nrows))
+    a = torch.randn((nrows, nrows), generator=gen, dtype=torch.float64)
     q, r = torch.linalg.qr(a, mode="reduced")
     diag_sign = torch.sign(torch.diag(r))
     diag_sign[diag_sign == 0] = 1.0
@@ -502,39 +507,39 @@ def _get_qr_rotation(ncols: int) -> Tensor:
     return q
 
 
-def _apply_qr_column_rotation(
+def _apply_qr_row_rotation(
     t: Tensor, *, inverse: bool = False
 ) -> Tensor:
-    ncols = t.shape[1]
-    q = _get_qr_rotation(ncols)
+    nrows = t.shape[0]
+    q = _get_qr_rotation(nrows)
     work = t.float().contiguous()
     if inverse:
-        return (work @ q.T).contiguous()
-    return (work @ q).contiguous()
+        return (q.T @ work).contiguous()
+    return (q @ work).contiguous()
 
 
-def get_column_rotation_kind_for_tensor(name: str, t: Tensor) -> str | None:
+def get_row_rotation_kind_for_tensor(name: str, t: Tensor) -> str | None:
     if not should_rotate_2d_tensor(name, t):
         return None
-    ncols = int(t.shape[1])
-    if is_power_of_two(ncols):
+    nrows = int(t.shape[0])
+    if is_power_of_two(nrows):
         return "hadamard"
     if INT8_ROTATE_NON_POWER2_FALLBACK == "qr":
         return "qr"
     return None
 
 
-def apply_fixed_column_rotation(
+def apply_fixed_row_rotation(
     name: str, t: Tensor, *, inverse: bool = False, rotation_kind: str | None = None
 ) -> Tensor:
-    kind = rotation_kind if rotation_kind is not None else get_column_rotation_kind_for_tensor(name, t)
+    kind = rotation_kind if rotation_kind is not None else get_row_rotation_kind_for_tensor(name, t)
     if kind is None:
         return t.float().contiguous()
     if kind == "hadamard":
-        return _apply_hadamard_column_rotation(t, inverse=inverse)
+        return _apply_hadamard_row_rotation(t, inverse=inverse)
     if kind == "qr":
-        return _apply_qr_column_rotation(t, inverse=inverse)
-    raise ValueError(f"Unknown column rotation kind: {kind}")
+        return _apply_qr_row_rotation(t, inverse=inverse)
+    raise ValueError(f"Unknown row rotation kind: {kind}")
 
 
 def quantize_float_tensor(
@@ -546,17 +551,17 @@ def quantize_float_tensor(
     if t32.ndim == 2:
         rotation_kind = None
         if name is not None:
-            rotation_kind = get_column_rotation_kind_for_tensor(name, t32)
+            rotation_kind = get_row_rotation_kind_for_tensor(name, t32)
         if rotation_kind is not None:
-            t32 = apply_fixed_column_rotation(
+            t32 = apply_fixed_row_rotation(
                 name if name is not None else "",
                 t32,
                 inverse=False,
                 rotation_kind=rotation_kind,
             )
             qmeta_extra = {
-                "column_rotation": rotation_kind,
-                "rotated_axis": 1,
+                "row_rotation": rotation_kind,
+                "rotated_axis": 0,
             }
 
         # Matrices: per-row int8, comme avant.
@@ -599,7 +604,7 @@ def quantize_float_tensor(
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Export format :
-    # - 2D float tensors éligibles : rotation colonne fixe + int8 per-row
+    # - 2D float tensors éligibles : rotation ligne fixe + int8 per-row
     # - autres float tensors : int8 comme avant
     # - non-floats : passthrough exact
     # - petits float tensors : passthrough fp16/fp32
@@ -661,7 +666,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
 
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_colrot_v2",
+        "__quant_format__": "int8_clean_per_row_rowrot_v2",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -693,9 +698,9 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             scale = float(s.item())
             deq = (q.float() * scale).contiguous()
 
-        rotation_kind = meta.get("column_rotation")
+        rotation_kind = meta.get("row_rotation")
         if isinstance(rotation_kind, str) and deq.ndim == 2:
-            deq = apply_fixed_column_rotation(
+            deq = apply_fixed_row_rotation(
                 name,
                 deq,
                 inverse=True,
