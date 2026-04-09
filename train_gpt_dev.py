@@ -356,21 +356,34 @@ def eval_val(
 # et de sa shape. Aucune grosse matrice dense n'est stockée.
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
-    pattern
+    pattern.strip()
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
         "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
     ).split(",")
-    if pattern
+    if pattern.strip()
 )
+
 INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
-    pattern
+    pattern.strip()
     for pattern in os.environ.get(
         "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
         ",".join(CONTROL_TENSOR_NAME_PATTERNS),
     ).split(",")
-    if pattern
+    if pattern.strip()
 )
+
+# Nouveau : exclusion ciblée des block transforms par nom de tenseur.
+# Exemple C5 : "tok_emb"
+INT8_BLOCK_TRANSFORM_EXCLUDE_NAME_PATTERNS = tuple(
+    pattern.strip()
+    for pattern in os.environ.get(
+        "INT8_BLOCK_TRANSFORM_EXCLUDE_NAME_PATTERNS",
+        "",
+    ).split(",")
+    if pattern.strip()
+)
+
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
@@ -382,6 +395,7 @@ INT8_BLOCK_TRANSFORM_MODE = os.environ.get(
 ).lower()
 INT8_BLOCK_SIZE = int(os.environ.get("INT8_BLOCK_SIZE", "32"))
 INT8_BLOCK_TRANSFORM_SEED = int(os.environ.get("INT8_BLOCK_TRANSFORM_SEED", "1337"))
+
 VALID_INT8_BLOCK_TRANSFORM_MODES = {
     "none",
     "perm_sign_col_blocks",
@@ -402,10 +416,14 @@ def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
 
+def name_matches_any_pattern(name: str, patterns: tuple[str, ...]) -> bool:
+    return any(pattern in name for pattern in patterns)
+
+
 def keep_float_tensor(
     name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]
 ) -> Tensor:
-    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
+    if name_matches_any_pattern(name, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
         return t.float().contiguous()
     if t.dtype in {torch.float32, torch.bfloat16}:
         passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
@@ -418,7 +436,8 @@ def should_block_transform_2d_tensor(name: str, t: Tensor) -> bool:
         INT8_BLOCK_TRANSFORM_MODE != "none"
         and t.ndim == 2
         and t.is_floating_point()
-        and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        and not name_matches_any_pattern(name, CONTROL_TENSOR_NAME_PATTERNS)
+        and not name_matches_any_pattern(name, INT8_BLOCK_TRANSFORM_EXCLUDE_NAME_PATTERNS)
     )
 
 
