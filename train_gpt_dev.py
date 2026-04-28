@@ -95,6 +95,12 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
+    # Optional depth recurrence: reuse selected physical blocks.
+    # Example: NUM_LAYERS=11, DEPTH_REPEAT_BLOCKS=3,4,5, DEPTH_REPEAT_EXTRA=2
+    # gives 11 + 3*2 = 17 effective block applications.
+    depth_repeat_blocks = os.environ.get("DEPTH_REPEAT_BLOCKS", "")
+    depth_repeat_extra = int(os.environ.get("DEPTH_REPEAT_EXTRA", 0))
+
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
@@ -1190,6 +1196,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        depth_repeat_blocks: str = "",
+        depth_repeat_extra: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1198,6 +1206,31 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.num_physical_layers = int(num_layers)
+        self.depth_repeat_extra = max(int(depth_repeat_extra), 0)
+
+        self.depth_repeat_blocks: set[int] = set()
+        if depth_repeat_blocks.strip():
+            self.depth_repeat_blocks = {
+                int(x.strip())
+                for x in depth_repeat_blocks.split(",")
+                if x.strip()
+            }
+
+        bad_blocks = [
+            i for i in self.depth_repeat_blocks
+            if i < 0 or i >= self.num_physical_layers
+        ]
+        if bad_blocks:
+            raise ValueError(
+                f"DEPTH_REPEAT_BLOCKS contains invalid block indices {bad_blocks} "
+                f"for NUM_LAYERS={self.num_physical_layers}"
+            )
+
+        self.virtual_num_layers = (
+            self.num_physical_layers
+            + len(self.depth_repeat_blocks) * self.depth_repeat_extra
+        )
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -1234,6 +1267,13 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def _run_block_with_repeats(self, block_idx: int, x: Tensor, x0: Tensor) -> Tensor:
+        x = self.blocks[block_idx](x, x0)
+        if block_idx in self.depth_repeat_blocks:
+            for _ in range(self.depth_repeat_extra):
+                x = self.blocks[block_idx](x, x0)
+        return x
+
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         bsz, seqlen = input_ids.shape
 
@@ -1244,12 +1284,14 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self._run_block_with_repeats(i, x, x0)
             skips.append(x)
+
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            block_idx = self.num_encoder_layers + i
+            x = self._run_block_with_repeats(block_idx, x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
 
@@ -1420,6 +1462,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        depth_repeat_blocks=args.depth_repeat_blocks,
+        depth_repeat_extra=args.depth_repeat_extra,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1495,6 +1539,12 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    log0(
+        f"depth_recurrence physical_layers:{base_model.num_physical_layers} "
+        f"virtual_layers:{base_model.virtual_num_layers} "
+        f"repeat_blocks:{sorted(base_model.depth_repeat_blocks)} "
+        f"repeat_extra:{base_model.depth_repeat_extra}"
+    )
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(
