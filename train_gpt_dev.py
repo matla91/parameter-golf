@@ -26,6 +26,10 @@ import uuid
 print("DEBUG: Imports standards OK", flush=True)
 
 import lzma
+try:
+    import brotli
+except Exception:
+    brotli = None
 from pathlib import Path
 
 print("DEBUG: LZMA et Pathlib OK", flush=True)
@@ -72,6 +76,15 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    # Optional SOTA-inspired sliding-window evaluation.
+    # If EVAL_SLIDING_STRIDE=0, disabled.
+    eval_sliding_stride = int(os.environ.get("EVAL_SLIDING_STRIDE", 0))
+    eval_sliding_batch_seqs = int(os.environ.get("EVAL_SLIDING_BATCH_SEQS", 8))
+
+    # Optional compression experiments.
+    enable_brotli = bool(int(os.environ.get("ENABLE_BROTLI", "0")))
+    brotli_quality = int(os.environ.get("BROTLI_QUALITY", "11"))
+    byte_shuffle_group = int(os.environ.get("BYTE_SHUFFLE_GROUP", "0"))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -349,6 +362,147 @@ def eval_val(
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
+def _model_forward_logits(model: nn.Module, x: Tensor) -> Tensor:
+    module = model.module if isinstance(model, DDP) else model
+    return module.forward_logits(x)
+
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    stride = int(args.eval_sliding_stride)
+    if stride <= 0:
+        raise ValueError("EVAL_SLIDING_STRIDE must be positive for sliding eval")
+    if stride > args.train_seq_len:
+        raise ValueError(
+            f"EVAL_SLIDING_STRIDE={stride} must be <= TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
+
+    batch_seqs = max(int(args.eval_sliding_batch_seqs), 1)
+    n_targets = val_tokens.numel() - 1
+
+    if n_targets < args.train_seq_len:
+        raise ValueError("Validation split too short for sliding evaluation")
+
+    starts = [0]
+    while starts[-1] + args.train_seq_len < n_targets:
+        next_start = min(starts[-1] + stride, n_targets - args.train_seq_len)
+        if next_start == starts[-1]:
+            break
+        starts.append(next_start)
+
+    # Simple split across ranks. In our current experiments world_size=1.
+    rank_starts = starts[rank::world_size]
+
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model.eval()
+    with torch.inference_mode():
+        last_target_counted = 0
+
+        for batch_start in range(0, len(rank_starts), batch_seqs):
+            current_starts = rank_starts[batch_start : batch_start + batch_seqs]
+
+            xs = []
+            ys = []
+            masks = []
+
+            for start in current_starts:
+                local = val_tokens[start : start + args.train_seq_len + 1].to(
+                    device=device, dtype=torch.int64, non_blocking=True
+                )
+                x = local[:-1]
+                y = local[1:]
+
+                target_global_first = start + 1
+                target_global_last = start + args.train_seq_len
+
+                count_from = max(last_target_counted + 1, target_global_first)
+                offset = max(0, count_from - target_global_first)
+
+                mask = torch.zeros(
+                    args.train_seq_len, device=device, dtype=torch.bool
+                )
+                if offset < args.train_seq_len:
+                    mask[offset:] = True
+                    last_target_counted = max(last_target_counted, target_global_last)
+
+                xs.append(x)
+                ys.append(y)
+                masks.append(mask)
+
+            x_batch = torch.stack(xs, dim=0)
+            y_batch = torch.stack(ys, dim=0)
+            mask_batch = torch.stack(masks, dim=0)
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logits = _model_forward_logits(model, x_batch)
+
+            losses = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                y_batch.reshape(-1),
+                reduction="none",
+            ).view_as(y_batch)
+
+            selected_losses = losses[mask_batch]
+            selected_prev = x_batch[mask_batch]
+            selected_tgt = y_batch[mask_batch]
+
+            val_loss_sum += selected_losses.to(torch.float64).sum()
+            val_token_count += float(selected_losses.numel())
+
+            token_bytes = base_bytes_lut[selected_tgt].to(dtype=torch.int16)
+            token_bytes += (
+                has_leading_space_lut[selected_tgt]
+                & ~is_boundary_token_lut[selected_prev]
+            ).to(dtype=torch.int16)
+            val_byte_count += token_bytes.to(torch.float64).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+
+    model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def byte_shuffle(data: bytes, group_size: int) -> bytes:
+    if group_size <= 1:
+        return data
+    n = len(data)
+    main_len = n - (n % group_size)
+    if main_len <= 0:
+        return data
+    main = np.frombuffer(data[:main_len], dtype=np.uint8).reshape(-1, group_size)
+    shuffled = main.T.copy().reshape(-1).tobytes()
+    return shuffled + data[main_len:]
+
+
+def byte_unshuffle(data: bytes, group_size: int, original_len: int) -> bytes:
+    if group_size <= 1:
+        return data
+    main_len = original_len - (original_len % group_size)
+    if main_len <= 0:
+        return data
+    rows = main_len // group_size
+    main = np.frombuffer(data[:main_len], dtype=np.uint8).reshape(group_size, rows)
+    unshuffled = main.T.copy().reshape(-1).tobytes()
+    return unshuffled + data[main_len:]
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1080,7 +1234,9 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        bsz, seqlen = input_ids.shape
+
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1096,17 +1252,27 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
+
         logits = self.logit_softcap * torch.tanh(
             logits_proj / self.logit_softcap
         )
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        return logits.view(bsz, seqlen, -1)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        logits = self.forward_logits(input_ids)
+        targets = target_ids.reshape(-1)
+        return F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)).float(),
+            targets,
+            reduction="mean",
+        )
 
 
 # -----------------------------
@@ -1581,6 +1747,43 @@ def main() -> None:
             f"int8_block_transform_summary mode:{INT8_BLOCK_TRANSFORM_MODE} "
             f"block_size:{INT8_BLOCK_SIZE} transformed_2d:{quant_stats['num_block_transformed_2d_tensors']}"
         )
+        if args.enable_brotli:
+            if brotli is None:
+                log0("brotli:unavailable import_failed")
+            else:
+                brotli_blob = brotli.compress(
+                    quant_raw, quality=int(args.brotli_quality)
+                )
+                log0(
+                    f"Serialized model int8+brotli: {len(brotli_blob)} bytes "
+                    f"quality:{args.brotli_quality}"
+                )
+                log0(
+                    f"Total submission size int8+brotli: {len(brotli_blob) + code_bytes} bytes"
+                )
+
+                if args.byte_shuffle_group > 1:
+                    shuffled = byte_shuffle(quant_raw, int(args.byte_shuffle_group))
+                    bs_brotli_blob = brotli.compress(
+                        shuffled, quality=int(args.brotli_quality)
+                    )
+
+                    roundtrip = byte_unshuffle(
+                        brotli.decompress(bs_brotli_blob),
+                        int(args.byte_shuffle_group),
+                        len(quant_raw),
+                    )
+                    if roundtrip != quant_raw:
+                        raise RuntimeError("byte_shuffle+brotli roundtrip failed")
+
+                    log0(
+                        f"Serialized model int8+byte_shuffle+brotli: {len(bs_brotli_blob)} bytes "
+                        f"quality:{args.brotli_quality} byte_shuffle_group:{args.byte_shuffle_group}"
+                    )
+                    log0(
+                        f"Total submission size int8+byte_shuffle+brotli: "
+                        f"{len(bs_brotli_blob) + code_bytes} bytes"
+                    )
 
     if distributed:
         dist.barrier()
@@ -1612,6 +1815,30 @@ def main() -> None:
     log0(
         f"final_int8_lzma_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}"
     )
+
+    if args.eval_sliding_stride > 0:
+        torch.cuda.synchronize()
+        t_seval = time.perf_counter()
+        s_val_loss, s_val_bpb = eval_val_sliding(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_int8_lzma_sliding val_loss:{s_val_loss:.4f} val_bpb:{s_val_bpb:.4f} "
+            f"stride:{args.eval_sliding_stride} batch_seqs:{args.eval_sliding_batch_seqs} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_seval):.0f}ms"
+        )
+        log0(
+            f"final_int8_lzma_sliding_exact val_loss:{s_val_loss:.8f} val_bpb:{s_val_bpb:.8f}"
+        )
 
     if distributed:
         dist.destroy_process_group()
